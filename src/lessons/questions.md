@@ -1336,3 +1336,136 @@ graph.print("graph: ", gtsam::MultiRobotKeyFormatter);
 | `Values::at<T>` 的查找 + 类型检查 | `gtsam/nonlinear/Values-inl.h:259-271` |
 | `ValuesKeyDoesNotExist` / `ValuesIncorrectType` | `gtsam/nonlinear/Values.h:440` 起 |
 | `unwhitenedError` 展开 `keys_[Indices]` | `gtsam/nonlinear/NoiseModelFactorN.h:417-433` |
+
+# lesson0TODO1的雅可比函数该怎么写，为什么？
+
+## 分析过程（先说我查了什么）
+
+我读了 `src/lessons/lesson0_template.cpp` 的当前版本（包括你未提交的改动）、`src/include/lesson_utils.hpp`、以及同类已成品因子 `src/include/factors/range_factor.hpp`（lesson1 的 1 维测距因子），然后在 `/tmp` 里写了 3 个独立小程序做了**实测**（没有改动仓库任何文件）：
+
+| 验证项 | 结果 |
+| --- | --- |
+| `NoiseModelFactorT<float, Point2, Point2>` 能不能编译（你现在的写法） | ❌ `error: could not convert ... from 'float' to 'gtsam::Vector'`（`NoiseModelFactorN.h:364`） |
+| `NoiseModelFactorT<gtsam::Vector1, ...>` + 1×2 雅可比 | ✅ `-fsyntax-only` 通过 |
+| H_from/H_to 与中心差分对比（点 (0.3,-0.2)→(1.9,1.9)，z=1.7） | ✅ `max_abs_diff = 2.08e-10` |
+| 距离三角形图（3 点 3 边）Hessian 零特征值个数 | ✅ **nullity = 3**，特征值 `-3.5e-14, -6.7e-15, 1.0e-13, 25.05, 1174.95, 1200` |
+| 给 P0 加先验后 | ✅ **nullity = 1**（只剩绕 P0 的旋转） |
+| 第 3 节那种「初值整体平移」在距离因子下的残差 | ⚠️ `error = 9.86e-30`（平移不改变距离 → 初值已经是最优解，LM 一步不走） |
+
+下面是结论和原因。
+
+---
+
+## 1. 雅可比：一条**单位行向量**，1×2
+
+设 $\Delta = p_{to} - p_{from}$，$r = \|\Delta\|$，$e = r - z$（标量）：
+
+$$
+\frac{\partial e}{\partial \Delta} = \frac{\Delta^{\mathsf T}}{\|\Delta\|} = \hat u^{\mathsf T}\ (1\times2),
+\qquad
+\frac{\partial \Delta}{\partial p_{to}} = +I,\quad
+\frac{\partial \Delta}{\partial p_{from}} = -I
+$$
+
+$$
+\boxed{H_{to} = +\hat u^{\mathsf T} = \frac{\Delta^{\mathsf T}}{\|\Delta\|},\qquad
+H_{from} = -\hat u^{\mathsf T} = -\frac{\Delta^{\mathsf T}}{\|\Delta\|}}
+$$
+
+也就是说 TODO 提示里的「$(\Delta/\|\Delta\|)^{\mathsf T}$ 乘 ±I」，**±I 只贡献一个符号**——因为 $\partial\Delta/\partial p$ 就是 $\pm I$，而 $1\times2$ 乘 $2\times2$ 只把符号带出来，不会把行向量变成矩阵。
+
+## 2. 代码怎么写
+
+```cpp
+class DistanceFactor   // 名字随意，别叫 OffsetFactor 了（不再偏移）
+    : public gtsam::NoiseModelFactorT<gtsam::Vector1, gtsam::Point2, gtsam::Point2> {
+public:
+  using Base = gtsam::NoiseModelFactorT<gtsam::Vector1, gtsam::Point2, gtsam::Point2>;
+  using Base::evaluateError;   // 你原来这行保留，必须的
+
+  DistanceFactor(gtsam::Key fromKey, gtsam::Key toKey, double measured,
+                 const gtsam::SharedNoiseModel &noiseModel)
+      : Base(noiseModel, fromKey, toKey), measured_(measured) {}
+
+  gtsam::Vector1 evaluateError(const gtsam::Point2 &p_from,
+                               const gtsam::Point2 &p_to,
+                               gtsam::Matrix *H_from = nullptr,
+                               gtsam::Matrix *H_to = nullptr) const override {
+    const gtsam::Vector2 delta = p_to - p_from;
+    const double r = delta.norm();
+
+    if (H_from || H_to) {
+      gtsam::Matrix12 J;                       // ∂‖Δ‖/∂Δ ：1x2
+      if (r > kEpsilon) {
+        J << delta.x() / r, delta.y() / r;     // 单位向量（行）
+      } else {
+        J.setZero();                           // 两点重合：方向无定义（和 RangeFactor 一样）
+      }
+      if (H_from) *H_from = -J;                // 1x2
+      if (H_to)   *H_to   =  J;                // 1x2
+    }
+
+    gtsam::Vector1 e;
+    e << r - measured_;
+    return e;
+  }
+  // clone / print 照抄原来的，measured_ 改成 double，measured() 返回 double
+private:
+  static constexpr double kEpsilon = 1e-9;
+  double measured_;
+};
+```
+
+三个容易踩的点，都在上面这段里解决了：
+
+1. **`H` 必须是 `dim(e) × dim(p)` = `1×2`**，不是 `2×2`。你现在的版本把残差改成标量了但 `H` 还写 `Matrix2`，`checkJacobian` 会直接判 `inf`（它先比形状），而且在 release 下 `linearize()` 里做 `Σ^{-1/2} · A` 时维度不匹配，是断言/未定义行为，不是「精度差一点」。
+2. **`OutputVec` 不能用 `float`**（实测编译失败）：基类 `unwhitenedError` 的返回类型硬编码是 `gtsam::Vector`，`return evaluateError(...)` 需要从 `float` 隐式构造 `Eigen::Matrix<double,-1,1>`，而 Eigen 的标量构造是 `explicit` → 报错。用 `gtsam::Vector1`（`traits<float>` 虽然存在，但解决不了这个转换问题）。
+3. **噪声模型必须是 1 维**：`noiseModel::Isotropic::Sigma(1, kOffsetSigma)`。`NoiseModelFactor::dim()` 返回的是**噪声模型的维度**，残差 1 维、噪声 2 维会在 `whiten()` 里炸掉。所以原来 `offsetNoise` 与 `priorNoise` 共用 `Sigma(2, …)` 的写法必须拆开。
+
+## 3. 为什么是这样（三条理由）
+
+**(a) 纯链式法则。** $e$ 只通过 $r=\|\Delta\|$ 依赖位置，而范数对向量的梯度就是「沿 $\Delta$ 方向的单位向量」$\Delta/\|\Delta\|$；再乘 $\partial\Delta/\partial p = \pm I$，就是 ±单位行向量。
+
+**(b) 几何上：距离只对「沿连线方向」的运动敏感。** 把 $p_{to}$ 沿垂直于连线的方向挪一下，$r$ 的一阶变化是 0。所以这一行雅可比的**模长恒为 1**（不管距离多远），信息量完全由白化权重 $1/\sigma$ 提供：白化后是 $w^2\hat u\hat u^{\mathsf T}$，秩 1，trace $= 1/\sigma^2$ = 400（对应我实测的特征值和恰好 1200 = 3×400）。对比原来的偏移因子 $H=\pm I$，两行范数都是 1 且**方向固定**，秩 2 —— 这就是 TODO 里「距离丢掉方向信息，秩更低」的确切含义。
+
+**(c) 它是**非线性**的，随线性化点变化。** 所以：① 不能在 `evaluateError` 里用 `z` 或真值算方向，必须用**当前估计**的 $p_{to}-p_{from}$；② 第 2 节的自检探针必须取「误差非零、两点不重合」的点（现有代码 `truth + (0.3,-0.2)` 之类就够），否则 $r=0$ 时方向退化、或探针落在解析解上掩盖错误；③ 初值离真值远时 GN 可能跑飞，LM 更稳。
+
+## 4. TODO1 不是只改 `evaluateError`，还要一起改这些（清单）
+
+| 位置（当前行号） | 现在 | 要改成 |
+| --- | --- | --- |
+| 128/130/138-140/142-144/164/167/170 | `float` / `Vector2 measured_` | `gtsam::Vector1` 输出 + `double measured_` |
+| 184-190 `Scenario` | `std::vector<Vector2> offsets` | `std::vector<double> ranges` |
+| 196-199 `makeScenario` | `z = truth[j]-truth[i] + noise` | `push_back((truth[j]-truth[i]).norm() + noise(rng))` |
+| 215 `buildGraph` | 传 `s.offsets[k]` | 传 `s.ranges[k]` |
+| 252 | `Isotropic::Sigma(2, kOffsetSigma)` | `Sigma(1, kOffsetSigma)`（先验仍是 `Sigma(2, kPriorSigma)`） |
+| 258-276 第 1 节 | 打印 2×2 的 ±I | 打印 1×2 的 `-uᵀ / +uᵀ`，`whiten(e)` 变成 1 维 |
+| 312-316 一致性检查 | `z02-(z01+z12)`（对距离无意义） | 三角不等式：`ranges[0]+ranges[1]-ranges[2] ≥ 0` |
+| 305 / 335 初值 | `makeInitial(s, shift)` 纯平移 | 见下面 ⚠️ |
+
+⚠️ **一个必须注意的副作用**（我实测过）：`makeInitial` 只做整体平移时，所有距离残差**恒等于 0**（`error ≈ 1e-29`），第 3 节「初值不准 → LM 拉回来」和第 5 节「两个初值 → 两个解」都会变成「什么都没发生」。建议给 `makeInitial` 加一个尺度扰动，例如：
+
+```cpp
+Values makeInitial(const Scenario &s, const Point2 &shift, double scale = 1.0) {
+  Values initial;
+  for (size_t i = 0; i < kNumPoints; ++i) {
+    const Point2 p = Point2(scale * s.truth[i].x(), scale * s.truth[i].y());
+    initial.insert(P(i), Point2(p + shift));   // scale=1.2 → 三角形被拉大，残差非零
+  }
+  return initial;
+}
+```
+（`truth[0]=(0,0)`，所以按原点缩放时 P0 不动，结果好解读。）
+
+## 5. 改成距离因子后第 5 节该期待什么（已实测）
+
+- 去掉先验：$6\times6$ Hessian，**nullity = 3** —— 2 个全局平移 + **1 个全局旋转**（距离对刚体运动不敏感），rank = 3（3 条边各贡献 1 维）。
+- 保留 P0 先验：**nullity = 1**，只剩「绕 P0 旋转」不可观 —— 这正好可以做成 TODO1 的第二个实验，说明「加先验只钉住了平移，没钉住旋转」。
+- 所以第 5 节现有那句「恰好 2 个不可观方向」的文案要改成 3，并且两个不同初值的解除了平移差之外还多一个旋转自由度（`P1-P0` 之差不再为 0）。
+
+## 6. 建议的收尾
+
+如果你希望我直接把这套改动落到 `src/lessons/lesson0_template.cpp`（并重跑 `xmake run lesson0` 确认第 2 节三处 `[ OK ]`、第 5 节 `nullity = 3`），请**切到 Act 模式**，我再动手。也可以只改因子类（保留 2 维偏移版本作为对照，另加一个 `DistanceFactor`），你选一个：
+
+- 方案 A：直接把 `OffsetFactor` 改造成距离因子（改动最小，正合 TODO1 原文）。
+- 方案 B：保留 `OffsetFactor`，新增 `DistanceFactor` 并在第 5 节对比两者 nullity=2 vs 3（教学效果更好，但改的地方更多）。
